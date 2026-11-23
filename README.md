@@ -98,7 +98,9 @@ node easy-mcp.js [folder] [--port 9494] [--no-tunnel] [--no-open]
 
 ## Security model
 
-- Every request needs the token (`Authorization: Bearer <token>` or `?token=<token>`); a fresh random token is generated per run unless `--token` / `EASY_MCP_TOKEN` is set.
+- Every request needs the token (`Authorization: Bearer <token>` or `?token=<token>`). The token is generated once and stored in `~/.easy-mcp/token` (so the link is stable); run with `--rotate-token` to replace it. `--token` / `EASY_MCP_TOKEN` override it.
+- OAuth connections (used by some AI clients) are never approved automatically: the consent page asks for your Easy MCP token. OAuth tokens are bound to the current master token (rotating it signs them all out), refresh tokens expire after 30 days of inactivity, and the dashboard has a "Revoke connections" button.
+- The dashboard is opened through a single-use launch link and then authenticated by an HttpOnly cookie; no secret is embedded in the page or in a browser URL.
 - The server binds `127.0.0.1` only; remote traffic goes through the tunnel.
 - File operations cannot escape the project folder (path traversal and absolute paths outside it are rejected, symlinks resolved).
 - Shell is off by default and only runs commands inside the project folder when you enable it.

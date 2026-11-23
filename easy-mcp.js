@@ -79,6 +79,7 @@ function loadToken() {
   return fresh;
 }
 const TOKEN = loadToken();
+const LAUNCH = crypto.randomBytes(24).toString('hex');
 const NO_TUNNEL = args.includes('--no-tunnel');
 const TUNNEL_MODE = NO_TUNNEL ? 'none' : args.includes('--funnel') ? 'funnel' : args.includes('--cloudflare') ? 'cloudflare' : '';
 const NO_OPEN = args.includes('--no-open');
@@ -146,13 +147,14 @@ async function main() {
   if (args.includes('--disable-shell')) serverArgs.push('--disable-shell');
   if (SKIP_JAIL) serverArgs.push('--dangerously-skip-jail');
   const server = spawn(process.execPath, serverArgs, {
-    env: { ...process.env, EASY_MCP_PORT: String(PORT), EASY_MCP_TOKEN: TOKEN, EASY_MCP_PROJECT: projectDir, ...(TUNNEL_MODE ? { EASY_MCP_TUNNEL: TUNNEL_MODE } : {}) },
+    env: { ...process.env, EASY_MCP_PORT: String(PORT), EASY_MCP_TOKEN: TOKEN, EASY_MCP_LAUNCH: LAUNCH, EASY_MCP_PROJECT: projectDir, ...(TUNNEL_MODE ? { EASY_MCP_TUNNEL: TUNNEL_MODE } : {}) },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   server.stdout.on('data', d => process.stdout.write(d));
   server.stderr.on('data', d => process.stderr.write(d));
 
-  const localDashboard = `http://127.0.0.1:${PORT}/?token=${TOKEN}`;
+  // Single-use launch secret: the master token never goes into a browser URL/history.
+  const localDashboard = `http://127.0.0.1:${PORT}/?launch=${LAUNCH}`;
   console.log(`Easy MCP v${VERSION}`);
   console.log(`Project:   ${projectDir}`);
   checkForUpdate();
