@@ -54,15 +54,33 @@ if (!TOKEN) {
     } catch {}
   }
 }
-// Per-process secret for the local dashboard control plane (/api/*). Embedded
-// in the dashboard HTML, which is only served to loopback requests.
+// Per-process secret for the local dashboard control plane (/api/*). It is
+// NEVER put in HTML or URLs: the browser receives it once, as an HttpOnly
+// SameSite=Strict cookie, in exchange for the single-use launch secret that
+// only the launcher (or the terminal output) knows.
 const ADMIN_SECRET = crypto.randomBytes(32).toString('hex');
+const LAUNCH_FROM_LAUNCHER = !!process.env.EASY_MCP_LAUNCH;
+const LAUNCH_SECRET = process.env.EASY_MCP_LAUNCH || crypto.randomBytes(24).toString('hex');
+let launchUsed = false;
+// Child processes (execute_command, jobs) inherit process.env: keep secrets out.
+delete process.env.EASY_MCP_TOKEN;
+delete process.env.EASY_MCP_LAUNCH;
 function sha256hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
 function safeEqual(a, b) {
   const ba = Buffer.from(String(a || ''));
   const bb = Buffer.from(String(b || ''));
   return ba.length === bb.length && ba.length > 0 && crypto.timingSafeEqual(ba, bb);
 }
+// OAuth tokens are bound to the master token: rotating it (--rotate-token)
+// invalidates every OAuth token issued under the previous one.
+const TOKEN_FP = sha256hex(TOKEN).slice(0, 32);
+const REFRESH_TTL = 30 * 86400000; // sliding 30 days
+function getCookie(req, name) {
+  const hit = String(req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith(name + '='));
+  return hit ? hit.slice(name.length + 1) : '';
+}
+function adminCookieOk(req) { return safeEqual(getCookie(req, 'emcp_admin'), ADMIN_SECRET); }
+function escHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 // Shell is OFF by default. Modern web models reason and search on their own
 // cloud VMs; Easy MCP only syncs files. Shell is an opt-in for local test
 // runs: --enable-shell at startup, or the dashboard toggle at runtime.
@@ -743,7 +761,7 @@ function authorized(req, url) {
   const sid = url.searchParams.get('sessionId');
   if (sid && sseSessionTokens.has(sid) && safeEqual(given, sseSessionTokens.get(sid))) return true;
   const rec = oauthTokens.get(sha256hex(given));
-  return !!(rec && rec.type === 'access' && (!rec.exp || rec.exp > Date.now()));
+  return !!(rec && rec.type === 'access' && rec.tk === TOKEN_FP && rec.exp && rec.exp > Date.now());
 }
 // Dashboard control plane: loopback Host + no tunnel/proxy headers. (Both
 // cloudflared and Tailscale Funnel proxy from 127.0.0.1, so the socket IP
@@ -1464,6 +1482,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
             <span class="slider"></span>
           </label>
         </div>
+
+        <div class="toggle-item" data-tip="Signs out every OAuth-connected AI client. The master MCP link keeps working; restart with --rotate-token to replace it too.">
+          <div class="toggle-meta">
+            <div class="t-title">Revoke connections</div>
+            <div class="t-desc">Sign out all connected AI clients (OAuth tokens)</div>
+          </div>
+          <button class="btn" onclick="revokeAll(this)">Revoke all</button>
+        </div>
       </div>
 
       <div class="telemetry-row">
@@ -1518,7 +1544,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 
 <script>
-const ADMIN = '__EASY_MCP_ADMIN__';
+const ADMIN = '1'; // CSRF marker only; real auth is the HttpOnly admin cookie
 const q = '';
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -1607,6 +1633,17 @@ async function toggleJail(checked){
     }
   }
   await saveSetting('skipJail', checked);
+}
+
+async function revokeAll(btn){
+  if (!confirm('Sign out every connected AI client? They will need to reconnect.')) return;
+  await fetch('/api/revoke-sessions' + q, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
+    body: '{}'
+  });
+  btn.textContent = 'Revoked';
+  setTimeout(() => { btn.textContent = 'Revoke all'; }, 1500);
 }
 
 async function stopJob(id){
@@ -1718,6 +1755,39 @@ function saveOAuth() {
     }
   } catch {}
 }
+// Drop tokens that expired or were issued under a previous master token.
+function pruneOAuthTokens() {
+  const now = Date.now();
+  for (const [h, rec] of oauthTokens) {
+    if (!rec || rec.tk !== TOKEN_FP || !rec.exp || rec.exp < now) oauthTokens.delete(h);
+  }
+}
+pruneOAuthTokens();
+const authorizeHits = [];
+function authorizeRateOk() {
+  const now = Date.now();
+  while (authorizeHits.length && authorizeHits[0] < now - 60000) authorizeHits.shift();
+  if (authorizeHits.length >= 10) return false;
+  authorizeHits.push(now);
+  return true;
+}
+function consentPage(res, params, status, error) {
+  const hidden = ['response_type', 'client_id', 'redirect_uri', 'state', 'code_challenge', 'code_challenge_method']
+    .map(k => `<input type="hidden" name="${k}" value="${escHtml(params.get(k) || '')}">`).join('');
+  let dest = '';
+  try { dest = new URL(params.get('redirect_uri') || '').host; } catch {}
+  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Easy MCP — approve connection</title>
+<style>body{font-family:system-ui,sans-serif;max-width:460px;margin:12vh auto;padding:0 20px;line-height:1.5}input[type=password]{width:100%;padding:10px;margin:10px 0;box-sizing:border-box}button{padding:10px 18px;cursor:pointer}.err{color:#c0392b}small{color:#666}</style></head><body>
+<h2>Approve this connection?</h2>
+<p>An AI client wants to access the project folder served by Easy MCP. After approval it will be sent back to <strong>${escHtml(dest || '(unknown)')}</strong>.</p>
+<p><small>Approve only if you just started connecting from your own AI client. If someone sent you this page, close it.</small></p>
+${error ? `<p class="err">${escHtml(error)}</p>` : ''}
+<form method="POST" action="/oauth/authorize">${hidden}
+<label>Easy MCP token (the last part of your MCP link, also in <code>~/.easy-mcp/token</code>)<input type="password" name="owner_token" autocomplete="off" autofocus required></label>
+<button type="submit">Approve</button></form></body></html>`;
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'", 'Referrer-Policy': 'no-referrer' });
+  res.end(html);
+}
 function pruneOAuthClients() {
   if (oauthClients.size <= 100) return;
   const sorted = [...oauthClients.entries()].sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
@@ -1775,7 +1845,26 @@ const server = http.createServer(async (req, res) => {
       // Dashboard control plane: local browser only — never through the
       // tunnel, never with an MCP/OAuth token.
       if (!isLocalAdminRequest(req)) return sendJson(res, 404, { error: 'Not found' });
-      if (url.pathname.startsWith('/api/') && !safeEqual(req.headers['x-easy-mcp-admin'] || '', ADMIN_SECRET)) {
+      // One-time launch link -> HttpOnly cookie. Nothing secret is ever in the
+      // HTML, the URL after the redirect, or an unauthenticated API response.
+      if (req.method === 'GET' && url.pathname === '/' && url.searchParams.has('launch')) {
+        if (!launchUsed && safeEqual(url.searchParams.get('launch') || '', LAUNCH_SECRET)) {
+          launchUsed = true;
+          res.writeHead(302, {
+            'Set-Cookie': `emcp_admin=${ADMIN_SECRET}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`,
+            Location: '/',
+            'Cache-Control': 'no-store'
+          });
+          return res.end();
+        }
+      }
+      if (!adminCookieOk(req)) {
+        if (url.pathname.startsWith('/api/')) return sendJson(res, 401, { error: 'Unauthorized' });
+        res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end('Easy MCP dashboard: open the Dashboard link printed in the terminal where Easy MCP is running (it works once per run).');
+      }
+      // CSRF marker: a custom header cannot be sent cross-site without a CORS preflight, which we never grant.
+      if (url.pathname.startsWith('/api/') && req.headers['x-easy-mcp-admin'] !== '1') {
         return sendJson(res, 401, { error: 'Unauthorized' });
       }
     } else if (!isPublicPath(url.pathname) && !authorized(req, url)) {
@@ -1796,7 +1885,7 @@ const server = http.createServer(async (req, res) => {
         scopes_supported: ['mcp', 'mcp:read', 'mcp:write'],
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code', 'refresh_token'],
-        code_challenge_methods_supported: ['S256', 'plain'],
+        code_challenge_methods_supported: ['S256'],
         token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic', 'none']
       });
     }
@@ -1850,36 +1939,38 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 201, out);
     }
 
-    if (url.pathname === '/oauth/authorize') {
-      const redirectUri = url.searchParams.get('redirect_uri');
-      const state = url.searchParams.get('state') || '';
-      const clientId = url.searchParams.get('client_id') || '';
+    if (url.pathname === '/oauth/authorize' && (req.method === 'GET' || req.method === 'POST')) {
+      // The authorization step is NOT automatic: whoever opens it must prove
+      // they hold the Easy MCP token (consent form). Without that, anyone who
+      // can reach the public tunnel hostname could mint themselves a token.
+      const params = req.method === 'POST' ? new URLSearchParams(await readBody(req, 65536)) : url.searchParams;
+      const redirectUri = params.get('redirect_uri') || '';
+      const state = params.get('state') || '';
+      const clientId = params.get('client_id') || '';
       const client = oauthClients.get(clientId);
-      if (redirectUri) {
-        if (!client) return sendJson(res, 400, { error: 'invalid_client', error_description: 'Unknown client_id — register first' });
-        if (url.searchParams.get('response_type') !== 'code') return sendJson(res, 400, { error: 'unsupported_response_type' });
-        const challenge = url.searchParams.get('code_challenge') || '';
-        if (!challenge && client.authMethod === 'none') return sendJson(res, 400, { error: 'invalid_request', error_description: 'code_challenge (PKCE) is required for public clients' });
-        const uriOk = client.redirect_uris.length ? client.redirect_uris.includes(redirectUri) : validRedirectUri(redirectUri);
-        if (!uriOk) return sendJson(res, 400, { error: 'invalid_redirect_uri' });
-        const code = crypto.randomBytes(32).toString('hex');
-        oauthCodes.set(code, {
-          exp: Date.now() + 600000,
-          challenge,
-          method: url.searchParams.get('code_challenge_method') || 'S256',
-          clientId,
-          redirectUri
-        });
-        if (oauthCodes.size > 100) { for (const [k, v] of oauthCodes) { if (v.exp < Date.now()) oauthCodes.delete(k); } }
-        const target = new URL(redirectUri);
-        target.searchParams.set('code', code);
-        if (state) target.searchParams.set('state', state);
-        const issBase = publicUrl || `http://${req.headers.host || '127.0.0.1:' + PORT}`;
-        target.searchParams.set('iss', issBase);
-        res.writeHead(302, { Location: target.toString() });
-        return res.end();
-      }
-      return sendJson(res, 200, { status: 'authorized' });
+      if (!redirectUri) return sendJson(res, 400, { error: 'invalid_request', error_description: 'redirect_uri is required' });
+      if (!client) return sendJson(res, 400, { error: 'invalid_client', error_description: 'Unknown client_id — register first' });
+      if (params.get('response_type') !== 'code') return sendJson(res, 400, { error: 'unsupported_response_type' });
+      const challenge = params.get('code_challenge') || '';
+      const method = params.get('code_challenge_method') || 'S256';
+      if (method !== 'S256') return sendJson(res, 400, { error: 'invalid_request', error_description: 'only code_challenge_method=S256 is supported' });
+      if (!challenge && client.authMethod === 'none') return sendJson(res, 400, { error: 'invalid_request', error_description: 'code_challenge (PKCE) is required for public clients' });
+      const uriOk = client.redirect_uris.length ? client.redirect_uris.includes(redirectUri) : validRedirectUri(redirectUri);
+      if (!uriOk) return sendJson(res, 400, { error: 'invalid_redirect_uri' });
+      if (req.method === 'GET') return consentPage(res, params, 200, '');
+      if (!authorizeRateOk()) return sendJson(res, 429, { error: 'rate_limited', error_description: 'Too many attempts, try again in a minute' });
+      if (!safeEqual(params.get('owner_token') || '', TOKEN)) return consentPage(res, params, 401, 'Wrong token.');
+      for (const [k, v] of oauthCodes) { if (v.exp < Date.now()) oauthCodes.delete(k); }
+      if (oauthCodes.size >= 100) return sendJson(res, 429, { error: 'rate_limited' });
+      const code = crypto.randomBytes(32).toString('hex');
+      oauthCodes.set(code, { exp: Date.now() + 600000, challenge, method, clientId, redirectUri });
+      const target = new URL(redirectUri);
+      target.searchParams.set('code', code);
+      if (state) target.searchParams.set('state', state);
+      const issBase = publicUrl || `http://${req.headers.host || '127.0.0.1:' + PORT}`;
+      target.searchParams.set('iss', issBase);
+      res.writeHead(303, { Location: target.toString(), 'Cache-Control': 'no-store' });
+      return res.end();
     }
 
     if (url.pathname === '/oauth/token' && req.method === 'POST') {
@@ -1898,12 +1989,13 @@ const server = http.createServer(async (req, res) => {
       const grantType = form.get('grant_type') || 'authorization_code';
       const mintTokens = (cid, keepRefresh) => {
         const access = 'emcp_at_' + crypto.randomBytes(32).toString('hex');
-        oauthTokens.set(sha256hex(access), { type: 'access', clientId: cid, exp: Date.now() + 86400000, createdAt: Date.now() });
+        oauthTokens.set(sha256hex(access), { type: 'access', clientId: cid, exp: Date.now() + 86400000, createdAt: Date.now(), tk: TOKEN_FP });
         let refresh = keepRefresh;
         if (!refresh) {
           refresh = 'emcp_rt_' + crypto.randomBytes(32).toString('hex');
-          oauthTokens.set(sha256hex(refresh), { type: 'refresh', clientId: cid, exp: 0, createdAt: Date.now() });
+          oauthTokens.set(sha256hex(refresh), { type: 'refresh', clientId: cid, exp: Date.now() + REFRESH_TTL, createdAt: Date.now(), tk: TOKEN_FP });
         }
+        pruneOAuthTokens();
         saveOAuth();
         return { access_token: access, token_type: 'Bearer', expires_in: 86400, refresh_token: refresh, scope: 'mcp' };
       };
@@ -1914,9 +2006,10 @@ const server = http.createServer(async (req, res) => {
         // hand back an opaque access token, keeping the same refresh token.
         if (rt && safeEqual(rt, TOKEN)) return sendJson(res, 200, mintTokens(clientId || 'legacy', TOKEN));
         const rec = oauthTokens.get(sha256hex(rt));
-        if (!rec || rec.type !== 'refresh') {
-          return sendJson(res, 401, { error: 'invalid_grant', error_description: 'Unknown refresh token' });
+        if (!rec || rec.type !== 'refresh' || rec.tk !== TOKEN_FP || !rec.exp || rec.exp < Date.now()) {
+          return sendJson(res, 401, { error: 'invalid_grant', error_description: 'Unknown, expired or revoked refresh token' });
         }
+        rec.exp = Date.now() + REFRESH_TTL; // sliding expiry while the client keeps using it
         const client = oauthClients.get(rec.clientId);
         if (client && client.authMethod !== 'none' && !safeEqual(sha256hex(secret), client.secretHash)) {
           return sendJson(res, 401, { error: 'invalid_client', error_description: 'Client secret mismatch' });
@@ -1939,7 +2032,7 @@ const server = http.createServer(async (req, res) => {
       let pkceOk = !rec.challenge;
       if (rec.challenge) {
         const verifier = form.get('code_verifier') || '';
-        pkceOk = !!verifier && safeEqual(rec.method === 'plain' ? verifier : crypto.createHash('sha256').update(verifier).digest('base64url'), rec.challenge);
+        pkceOk = !!verifier && safeEqual(crypto.createHash('sha256').update(verifier).digest('base64url'), rec.challenge);
       }
       const client = oauthClients.get(rec.clientId);
       let secretOk = !client || client.authMethod === 'none';
@@ -1954,7 +2047,7 @@ const server = http.createServer(async (req, res) => {
       // no-store: the page embeds a per-process admin secret; a cached copy
       // from a previous run would silently break every dashboard action.
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      return res.end(DASHBOARD_HTML.replace('__EASY_MCP_ADMIN__', ADMIN_SECRET));
+      return res.end(DASHBOARD_HTML);
     }
     if (req.method === 'GET' && url.pathname === '/api/dashboard') {
       return sendJson(res, 200, dashboardData());
@@ -1999,6 +2092,14 @@ const server = http.createServer(async (req, res) => {
       if (typeof body.disableShell === 'boolean') DISABLE_SHELL = body.disableShell;
       if (typeof body.skipJail === 'boolean') SKIP_JAIL = body.skipJail;
       return sendJson(res, 200, { success: true, readOnly: READ_ONLY, disableShell: DISABLE_SHELL, skipJail: SKIP_JAIL });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/revoke-sessions') {
+      // Signs out every OAuth-connected client. The master MCP link keeps
+      // working; run with --rotate-token to replace it as well.
+      oauthTokens.clear();
+      oauthCodes.clear();
+      saveOAuth();
+      return sendJson(res, 200, { success: true });
     }
     if (req.method === 'POST' && url.pathname === '/api/stop-job') {
       const { id } = JSON.parse(await readBody(req) || '{}');
@@ -2112,6 +2213,7 @@ server.on('error', (err) => {
 });
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`Easy MCP server on http://127.0.0.1:${PORT} — project: ${projectRoot}`);
+  if (!LAUNCH_FROM_LAUNCHER) console.log(`Dashboard: http://127.0.0.1:${PORT}/?launch=${LAUNCH_SECRET}  (single use)`);
   startTunnel(tunnelMode).catch(err => { tunnelError = err.message; });
   if (SKIP_JAIL) console.log('WARNING: --dangerously-skip-jail is ON. The AI can access the whole machine.');
 });
